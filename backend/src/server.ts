@@ -1,65 +1,189 @@
 import express from "express";
-import cors from "cors";
 import dotenv from "dotenv";
-
+import cors from "cors";
+import {FormData} from "undici";
+ 
 dotenv.config();
 const app = express();
 app.use(express.json());
-app.use(cors({ origin: process.env.FRONTEND_ORIGIN }));
-type ChatMessage = { role: "system" | "user" | "assistant"; content: string };
+app.use(cors({ origin: process.env.FRONTEND_ORIGIN || "http://localhost:5173" }));
+const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
  
-function trimToRecent(messages: ChatMessage[], maxMessages = 8) {
-  return messages.length <= maxMessages
-    ? messages
-    : messages.slice(-maxMessages);
-}
- 
+// stage 1
+
 app.post("/api/chat", async (req, res) => {
-  console.log("📩 Received chat request:", req.body);
   try {
-    const { messages } = req.body as { messages: ChatMessage[] }; 
+    const { messages } = req.body || {};
     if (!Array.isArray(messages)) {
       return res.status(400).json({ error: "Invalid messages format" });
     }
-    const trimmed = trimToRecent(messages, 8);
-
-    const groqRes = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+ 
+    const groqRes = await fetch(GROQ_URL, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "Authorization": `Bearer ${process.env.OPENAI_API_KEY}` // still using same env var
+        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
       },
-
       body: JSON.stringify({
         model: process.env.OPENAI_MODEL || "llama3-8b-8192",
-        messages: trimmed,
+        messages,
         max_tokens: 800,
-        temperature: 0.7
-      })
+        temperature: 0.7,
+      }),
     });
  
     const data = await groqRes.json();
     if (!groqRes.ok) {
-      console.error("❌ Groq API error:", data);
-      return res.status(groqRes.status).json({ error: data });
+      console.error("Stage1 Groq error:", data);
+      return res.status(groqRes.status).json({ error: data.error || "Chat failed" });
+    }
+    const message =
+      data.choices?.[0]?.message || { role: "assistant", content: "Sorry, no response." };
+    res.json({ message });
+  } catch (err: any) {
+    console.error("Chat error:", err);
+    res.status(500).json({ error: "Failed to chat" });
+  }
+});
+
+// stage 2
+
+app.post("/api/stage2", async (req, res) => {
+  try {
+    const { world, name } = req.body || {};
+    if (!world || !name) {
+      return res.status(400).json({ error: "World and name are required" });
+    }
+    const groqRes = await fetch(GROQ_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: process.env.OPENAI_MODEL || "llama3-8b-8192",
+        messages: [
+          {
+            role: "system",
+            content:
+              "You are a world entity generator. Respond ONLY with valid JSON. No explanations, no extra text. JSON must have keys: name, type, description, abilities (array of strings).",
+          },
+          {
+            role: "user",
+            content: `Generate the entity for "${name}" in the world of "${world}".`,
+          },
+        ],
+
+        response_format: { type: "json_object" },
+        max_tokens: 600,
+        temperature: 0.7,
+      }),
+    });
+ 
+    const data = await groqRes.json();
+    if (!groqRes.ok) {
+      console.error("Stage2 Groq error:", data);
+      return res.status(groqRes.status).json({ error: data.error || "Stage2 failed" });
+    }
+    let worldEntity: any;
+    try {
+      const raw = data.choices?.[0]?.message?.content || "{}";
+      worldEntity = typeof raw === "string" ? JSON.parse(raw) : raw;
+    } catch (e) {
+      console.error("Stage2 JSON parse error:", e);
+      return res.status(500).json({ error: "Invalid JSON received from model" });
     }
  
-    const reply = data.choices?.[0]?.message?.content || "";
-    res.json({
-      message: {
-        role: "assistant",
-        content: reply,
-        timestamp: new Date().toISOString(),
-      },
-    });
+    if (Array.isArray(worldEntity?.abilities)) {
+      worldEntity.abilities = worldEntity.abilities.map((a: any) =>
+        typeof a === "string" ? a : JSON.stringify(a)
+      );
+    } else {
+      worldEntity.abilities = [];
+    }
 
+    res.json({ worldEntity });
   } catch (err: any) {
-    console.error("❌ Backend error:", err);
-    res.status(500).json({ error: err.message || "Server error" });
+    console.error("Stage2 error:", err);
+    res.status(500).json({ error: "Failed to generate entity" });
   }
 });
  
-const port = Number(process.env.PORT || 5000);
-app.listen(port, () => console.log(`✅ Backend running on port ${port}`));
+// stage 3
+
+app.post("/api/world", async (req, res) => {
+  try {
+    const { world, name } = req.body || {};
+    if (!world || !name) {
+      return res.status(400).json({ error: "World and name are required" });
+    }
+
+    const groqRes = await fetch(GROQ_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: process.env.OPENAI_MODEL || "llama3-8b-8192",
+        messages: [
+          {
+            role: "system",
+            content:
+              "You are a world entity generator. Respond ONLY with valid JSON. No explanations, no extra text. JSON must have keys: name, type, description, abilities (array of strings).",
+          },
+          {
+            role: "user",
+            content: `Generate the entity for "${name}" in the world of "${world}".`,
+          },
+        ],
+        response_format: { type: "json_object" },
+        max_tokens: 600,
+        temperature: 0.7,
+      }),
+    });
+ 
+    const entityData = await groqRes.json();
+    if (!groqRes.ok) {
+      console.error("Stage3 Groq error:", entityData);
+      return res
+        .status(groqRes.status)
+        .json({ error: entityData.error || "World JSON failed" });
+    }
+ 
+    let worldEntity: any;
+    try {
+      const raw = entityData.choices?.[0]?.message?.content || "{}";
+      worldEntity = typeof raw === "string" ? JSON.parse(raw) : raw;
+    } catch (e) {
+      console.error("Stage3 JSON parse error:", e);
+      return res.status(500).json({ error: "Invalid JSON from model" });
+    }
+ 
+    if (Array.isArray(worldEntity?.abilities)) {
+      worldEntity.abilities = worldEntity.abilities.map((a: any) =>
+        typeof a === "string" ? a : JSON.stringify(a)
+      );
+    } else {
+      worldEntity.abilities = [];
+    }
+ 
+    const prompt = `${worldEntity.name}, ${worldEntity.type}. ${worldEntity.description}. Cinematic, detailed, coherent with a ${world} setting.`;
+    const polliUrl = `https://image.pollinations.ai/prompt/${encodeURIComponent(
+      prompt
+    )}`;
+ 
+    worldEntity.image = polliUrl;
+    return res.json({ worldEntity });
+  } catch (err: any) {
+    console.error("Stage3 error:", err);
+    res
+      .status(500)
+      .json({ error: "Failed to generate entity with image" });
+  }
+});
+
+const PORT = Number(process.env.PORT || 5000);
+app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
 
  
